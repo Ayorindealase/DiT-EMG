@@ -48,7 +48,7 @@ N_CHANNELS      = 12        # EMG channels from Delsys Trigno
 SAMPLING_RATE   = 2000      # Hz
 WINDOW_SIZE     = 200       # samples = 100ms window @ 2kHz
 WINDOW_STRIDE   = 100       # samples = 50ms hop (50% overlap)
-N_CLASSES       = 18        # Exercise 1: 17 gestures + rest (class 0)
+N_CLASSES       = 24       # Exercise 2:23 gestures + rest (class 0)
 
 # Data splits
 VAL_SUBJECTS    = [1, 2]    # Subject IDs held out for validation (1-indexed)
