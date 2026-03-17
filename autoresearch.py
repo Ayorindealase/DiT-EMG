@@ -372,11 +372,111 @@ def append_log_entry(entry: str, experiment_n: int, metrics: dict):
         f"- psd_error: {metrics.get('psd_error', '?')}\n"
         f"- dtw_mean:  {metrics.get('dtw_mean', '?')}\n"
     )
-
     full_entry = entry + result_block + "\n\n---\n\n"
-
     with open(EXPERIMENT_LOG, "a", encoding="utf-8") as f:
         f.write(full_entry)
+
+
+PAPER_TRACKER = Path("paper_tracker.md")
+
+def update_paper_tracker(experiment_n: int, change: str, hypothesis: str,
+                          metrics: dict, decision: str, best_fid: float):
+    """
+    Update paper_tracker.md after every experiment.
+    Adds a row to the results table and updates the best config block.
+    This document becomes the source of truth for writing the paper.
+    """
+    if not PAPER_TRACKER.exists():
+        return
+
+    fid       = metrics.get('fid', metrics.get('val_fid', 0))
+    tstr_acc  = metrics.get('tstr_acc', 0)
+    trtr_acc  = metrics.get('trtr_acc', 0)
+    psd_error = metrics.get('psd_error', 0)
+    ratio     = round(tstr_acc / trtr_acc, 3) if trtr_acc > 0 else 0
+
+    content = PAPER_TRACKER.read_text(encoding="utf-8")
+
+    # ── 1. Add row to results table ───────────────────────
+    new_row = (
+        f"| {experiment_n} | {change[:50]} | "
+        f"{fid:.2f} | {tstr_acc:.4f} | {trtr_acc:.4f} | "
+        f"{ratio:.3f} | {psd_error:.2f} | {decision} |\n"
+    )
+    # Insert before the closing --- of the table section
+    table_marker = "---\n\n## SECTION B"
+    if table_marker in content:
+        content = content.replace(table_marker, new_row + table_marker)
+
+    # ── 2. Update best config if improved ─────────────────
+    if decision == "KEEP":
+        # Read current train.py hparams
+        train_src = read_file(TRAIN_FILE)
+        hparams   = {}
+        for param in ["D_MODEL", "DEPTH", "N_HEADS", "PATCH_SIZE",
+                      "T_STEPS", "SCHEDULE", "SAMPLE_GUIDANCE",
+                      "LEARNING_RATE", "BATCH_SIZE"]:
+            for line in train_src.split("\n"):
+                if f"{param}" in line and "=" in line and "#" not in line.split("=")[0][-1:]:
+                    try:
+                        val = line.split("=")[1].strip().split("#")[0].strip().strip('"')
+                        hparams[param] = val
+                        break
+                    except Exception:
+                        pass
+
+        best_block = (
+            f"```\n"
+            f"Best val_fid     : {best_fid:.4f}\n"
+            f"Best experiment  : {experiment_n}\n"
+            f"Key hyperparams  : "
+            f"D_MODEL={hparams.get('D_MODEL','?')}, "
+            f"DEPTH={hparams.get('DEPTH','?')}, "
+            f"N_HEADS={hparams.get('N_HEADS','?')}, "
+            f"PATCH={hparams.get('PATCH_SIZE','?')}\n"
+            f"                   "
+            f"T={hparams.get('T_STEPS','?')}, "
+            f"Schedule={hparams.get('SCHEDULE','?')}, "
+            f"Guidance={hparams.get('SAMPLE_GUIDANCE','?')}\n"
+            f"                   "
+            f"Batch={hparams.get('BATCH_SIZE','?')}, "
+            f"LR={hparams.get('LEARNING_RATE','?')}\n"
+            f"```"
+        )
+        # Replace existing best block
+        import re
+        content = re.sub(r"```\nBest val_fid.*?```", best_block,
+                         content, flags=re.DOTALL)
+
+    # ── 3. Update timestamp ────────────────────────────────
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    content = re.sub(
+        r"\*\*Last updated\*\*:.*",
+        f"**Last updated**: {timestamp} (Experiment {experiment_n})",
+        content
+    )
+
+    # ── 4. Add discovery note if big improvement ──────────
+    if decision == "KEEP":
+        baseline = 3218.9959
+        improvement_pct = (baseline - fid) / baseline * 100
+        if improvement_pct > 10:
+            discovery = (
+                f"\n- **Exp {experiment_n}** ({timestamp}): "
+                f"{change} → FID dropped {improvement_pct:.1f}% "
+                f"to {fid:.2f}. {hypothesis}\n"
+            )
+            content = content.replace(
+                "*Nothing yet — experiments starting now.*",
+                discovery.strip()
+            )
+            # Append to existing discoveries
+            if "**Exp" in content and "*Nothing yet*" not in content:
+                disc_marker = "---\n\n## SECTION E"
+                if disc_marker in content:
+                    content = content.replace(disc_marker, discovery + disc_marker)
+
+    PAPER_TRACKER.write_text(content, encoding="utf-8")
 
 
 # ─────────────────────────────────────────────
@@ -488,6 +588,16 @@ def run_autoresearch(n_experiments: int = 50, start_from: int = 2):
                 parsed["log_entry"] + f"\n**Decision**: {decision}",
                 exp_n, metrics
             )
+
+        # ── Update paper tracker ──────────────────────────
+        update_paper_tracker(
+            experiment_n = exp_n,
+            change       = parsed["change"],
+            hypothesis   = parsed["hypothesis"],
+            metrics      = metrics,
+            decision     = decision,
+            best_fid     = best_fid,
+        )
 
         # ── Print summary ──────────────────────────────────
         print(f"\n  Experiment {exp_n} summary:")
