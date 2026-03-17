@@ -1,23 +1,22 @@
 """
 autoresearch.py — Autonomous Research Loop for DiT-EMG
 =======================================================
-Runs overnight. Calls Claude API to iteratively improve train.py,
-guided by program.md and the results from each experiment.
+Calls Claude API to iteratively improve train.py overnight.
+
+Key design: Claude returns ONE line change (old line → new line).
+We apply it with a simple string replace. No full-file rewrites.
+This is reliable, fast, and never fails to parse.
 
 Usage:
-    # In Kaggle notebook:
     import os
     from kaggle_secrets import UserSecretsClient
     os.environ["ANTHROPIC_API_KEY"] = UserSecretsClient().get_secret("ANTHROPIC_API_KEY")
-    !python autoresearch.py --experiments 50
-
-    # Or locally:
-    export ANTHROPIC_API_KEY=sk-ant-...
-    python autoresearch.py --experiments 20
+    !python autoresearch.py --experiments 30 --start-from 2
 """
 
 import os
 import sys
+import re
 import json
 import time
 import shutil
@@ -31,15 +30,18 @@ from datetime import datetime
 # CONFIG
 # ─────────────────────────────────────────────
 
-ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages"
-MODEL              = "claude-sonnet-4-20250514"
-MAX_TOKENS         = 4096
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+MODEL             = "claude-sonnet-4-20250514"
+MAX_TOKENS        = 1024   # Small — we only need 4 lines back, not 833
 
-TRAIN_FILE         = Path("train.py")
-PROGRAM_FILE       = Path("program.md")
-RESULTS_FILE       = Path("results.jsonl")
-EXPERIMENT_LOG     = Path("experiment_log.md")
-BACKUP_DIR         = Path("backups")
+TRAIN_FILE        = Path("train.py")
+PROGRAM_FILE      = Path("program.md")
+RESULTS_FILE      = Path("results.jsonl")
+EXPERIMENT_LOG    = Path("experiment_log.md")
+PAPER_TRACKER     = Path("paper_tracker.md")
+BACKUP_DIR        = Path("backups")
+
+BASELINE_FID      = 3218.9959   # Experiment 1 — real NinaPro E2 data
 
 # ─────────────────────────────────────────────
 # UTILITIES
@@ -50,106 +52,144 @@ def get_api_key() -> str:
     if not key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY not set.\n"
-            "In Kaggle: from kaggle_secrets import UserSecretsClient; "
-            "os.environ['ANTHROPIC_API_KEY'] = UserSecretsClient().get_secret('ANTHROPIC_API_KEY')\n"
-            "Locally: export ANTHROPIC_API_KEY=sk-ant-..."
+            "Run: import os; from kaggle_secrets import UserSecretsClient; "
+            "os.environ['ANTHROPIC_API_KEY'] = UserSecretsClient().get_secret('ANTHROPIC_API_KEY')"
         )
     return key
 
 
 def read_file(path: Path) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return ""
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def read_results(n_recent: int = 10) -> str:
-    """Read the last N experiment results from results.jsonl."""
+def extract_hparams_block(train_py: str) -> str:
+    """Extract only the hyperparameters block from train.py."""
+    lines      = train_py.split("\n")
+    collecting = False
+    result     = []
+
+    for line in lines:
+        if "HYPERPARAMETERS" in line and "❶" in line:
+            collecting = True
+        if collecting:
+            result.append(line)
+        if collecting and len(result) > 5 and line.strip() == "":
+            # Stop at first blank line after 5+ lines collected
+            if len(result) > 30:
+                break
+
+    # Fallback — just grab lines with the key hyperparameter names
+    if len(result) < 5:
+        keywords = ["TRAIN_TIME_SECONDS", "BATCH_SIZE", "LEARNING_RATE",
+                    "WEIGHT_DECAY", "PATCH_SIZE", "D_MODEL", "N_HEADS",
+                    "DEPTH", "D_FF_MULT", "DROPOUT", "T_STEPS", "SCHEDULE",
+                    "BETA_START", "BETA_END", "SAMPLE_STEPS", "SAMPLE_GUIDANCE",
+                    "CFG_DROPOUT", "CLASS_EMBED_DIM"]
+        result = [l for l in lines if any(k in l for k in keywords)]
+
+    return "\n".join(result[:60])
+
+
+def read_results_summary(n: int = 8) -> str:
+    """Summarise last N results from results.jsonl."""
     if not RESULTS_FILE.exists():
-        return "No results yet — this is the first experiment."
+        return f"No results yet. Baseline val_fid = {BASELINE_FID}"
 
-    lines = RESULTS_FILE.read_text().strip().split("\n")
-    lines = [l for l in lines if l.strip()]
-
+    lines = [l for l in RESULTS_FILE.read_text().split("\n") if l.strip()]
     if not lines:
-        return "No results yet — this is the first experiment."
+        return f"No results yet. Baseline val_fid = {BASELINE_FID}"
 
-    recent = lines[-n_recent:]
-    results = []
-    for line in recent:
+    best_fid = BASELINE_FID
+    rows     = []
+    for line in lines[-n:]:
         try:
-            r = json.loads(line)
-            results.append(
-                f"  step={r.get('step','?')} | "
-                f"val_fid={r.get('fid', r.get('val_fid','?')):.4f} | "
-                f"tstr_acc={r.get('tstr_acc','?'):.4f} | "
-                f"psd_error={r.get('psd_error','?'):.4f} | "
-                f"elapsed={r.get('elapsed_s','?'):.0f}s"
+            r   = json.loads(line)
+            fid = r.get("fid", r.get("val_fid", "?"))
+            if isinstance(fid, float) and fid < best_fid:
+                best_fid = fid
+            rows.append(
+                f"  fid={fid:.2f}  tstr={r.get('tstr_acc','?'):.3f}  "
+                f"psd={r.get('psd_error','?'):.1f}  step={r.get('step','?')}"
             )
         except Exception:
             continue
 
-    if not results:
-        return "No valid results yet."
-
-    # Find best FID
-    best_fid = float("inf")
-    for line in lines:
-        try:
-            r = json.loads(line)
-            fid = r.get('fid', r.get('val_fid', float('inf')))
-            if isinstance(fid, (int, float)) and fid < best_fid:
-                best_fid = fid
-        except Exception:
-            continue
-
     return (
+        f"Baseline val_fid : {BASELINE_FID}\n"
         f"Best val_fid so far: {best_fid:.4f}\n"
-        f"Last {len(results)} experiments:\n" +
-        "\n".join(results)
+        f"Last {len(rows)} results:\n" + "\n".join(rows)
     )
 
 
-def read_experiment_log(n_recent: int = 3) -> str:
-    """Read the last N experiment log entries."""
+def read_recent_log(n: int = 2) -> str:
+    """Read last N experiment log entries."""
     if not EXPERIMENT_LOG.exists():
-        return "No experiment log yet."
-
-    content = EXPERIMENT_LOG.read_text(encoding="utf-8")
-    # Split by experiment headers
-    entries = content.split("## Experiment")
-    entries = [e for e in entries if e.strip()]
-
-    if not entries:
-        return "No experiment log yet."
-
-    recent = entries[-n_recent:]
-    return "## Experiment" + "\n## Experiment".join(recent)
+        return "No experiments yet."
+    entries = EXPERIMENT_LOG.read_text(encoding="utf-8").split("---")
+    recent  = [e.strip() for e in entries if e.strip()][-n:]
+    return "\n\n---\n\n".join(recent) if recent else "No experiments yet."
 
 
-def backup_train_py(experiment_n: int):
-    """Save a backup of train.py before modifying."""
+def backup_train_py(exp_n: int):
     BACKUP_DIR.mkdir(exist_ok=True)
-    backup_path = BACKUP_DIR / f"train_exp{experiment_n:03d}.py"
-    shutil.copy(TRAIN_FILE, backup_path)
+    shutil.copy(TRAIN_FILE, BACKUP_DIR / f"train_exp{exp_n:03d}.py")
 
 
-def restore_train_py(experiment_n: int) -> bool:
-    """Restore train.py from backup if experiment failed."""
-    backup_path = BACKUP_DIR / f"train_exp{experiment_n:03d}.py"
-    if backup_path.exists():
-        shutil.copy(backup_path, TRAIN_FILE)
-        print(f"  [restore] train.py restored from backup {experiment_n}")
-        return True
-    return False
+def restore_train_py(exp_n: int):
+    backup = BACKUP_DIR / f"train_exp{exp_n:03d}.py"
+    if backup.exists():
+        shutil.copy(backup, TRAIN_FILE)
+        print(f"  [restore] train.py restored from experiment {exp_n} backup")
 
 
 # ─────────────────────────────────────────────
-# CLAUDE API CALL
+# CLAUDE API
 # ─────────────────────────────────────────────
 
-def call_claude(prompt: str, system: str, api_key: str) -> str:
-    """Call Claude API and return the response text."""
+SYSTEM_PROMPT = """\
+You are an elite ML research agent improving DiT-EMG — a diffusion transformer \
+for synthetic sEMG generation. Your job: make ONE precise, theoretically-justified \
+change to reduce val_fid.
+
+You MUST respond in EXACTLY this format — four labeled fields, nothing else:
+
+HYPOTHESIS: <one sentence: why this specific change reduces val_fid based on EMG signal theory>
+
+CHANGE_LINE: <the exact current line from train.py to change — copy it verbatim>
+
+NEW_LINE: <the exact replacement line — only the line itself, no explanation>
+
+LOG_ENTRY: <2-3 sentences: theoretical motivation, predicted effect, what metric to watch>
+
+Rules:
+- ONE change only — never modify two independent parameters
+- CHANGE_LINE must be an exact verbatim copy of a line that exists in the hyperparameters
+- Do not include any code blocks, backticks, or extra text
+- Base decisions on EMG signal theory, not random search
+"""
+
+
+def build_prompt(exp_n: int, hparams: str,
+                 results: str, recent_log: str) -> str:
+    return f"""\
+Experiment {exp_n}.
+
+CURRENT RESULTS:
+{results}
+
+RECENT EXPERIMENT LOG:
+{recent_log}
+
+CURRENT HYPERPARAMETERS (from train.py):
+{hparams}
+
+What single change should Experiment {exp_n} test?
+Remember: target val_fid < 500, tstr_acc/trtr_acc ratio > 0.85.
+Respond with HYPOTHESIS, CHANGE_LINE, NEW_LINE, LOG_ENTRY only.\
+"""
+
+
+def call_claude(prompt: str, api_key: str) -> str:
     headers = {
         "Content-Type":      "application/json",
         "anthropic-version": "2023-06-01",
@@ -158,210 +198,159 @@ def call_claude(prompt: str, system: str, api_key: str) -> str:
     body = {
         "model":      MODEL,
         "max_tokens": MAX_TOKENS,
-        "system":     system,
+        "system":     SYSTEM_PROMPT,
         "messages":   [{"role": "user", "content": prompt}],
     }
-
     for attempt in range(3):
         try:
             resp = requests.post(ANTHROPIC_API_URL, headers=headers,
-                                 json=body, timeout=120)
+                                 json=body, timeout=60)
             if resp.status_code == 200:
-                data = resp.json()
-                return data["content"][0]["text"]
+                return resp.json()["content"][0]["text"]
             elif resp.status_code == 429:
                 wait = 30 * (attempt + 1)
                 print(f"  [api] Rate limited — waiting {wait}s...")
                 time.sleep(wait)
             else:
-                print(f"  [api] Error {resp.status_code}: {resp.text[:200]}")
+                print(f"  [api] HTTP {resp.status_code}: {resp.text[:200]}")
                 time.sleep(10)
         except Exception as e:
-            print(f"  [api] Exception: {e}")
+            print(f"  [api] Error: {e}")
             time.sleep(10)
-
-    raise RuntimeError("Claude API call failed after 3 attempts")
-
-
-# ─────────────────────────────────────────────
-# AGENT PROMPTS
-# ─────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are an elite ML research agent working on DiT-EMG — 
-a Diffusion Transformer for synthetic sEMG generation. 
-
-Your sole job is to improve val_fid by making ONE precise, 
-theoretically-justified change to train.py per experiment.
-
-You must respond in this EXACT format and nothing else:
-
-HYPOTHESIS: <one sentence — why this change should improve val_fid>
-
-CHANGE: <exact description of what to modify>
-
-NEW_TRAIN_PY:
-```python
-<complete modified train.py — the entire file>
-```
-
-EXPERIMENT_LOG_ENTRY:
-```markdown
-## Experiment {N} — <one-line description>
-
-**Theoretical motivation**: <why this works based on EMG signal properties>
-
-**Change**: <exact change made>
-
-**Prediction**: <expected direction and magnitude on val_fid>
-```
-
-Rules:
-- Change ONLY the hyperparameters block or specific functions — never change the evaluate() call or TRAIN_TIME_SECONDS
-- One change per experiment — never modify two independent things
-- The complete train.py must be syntactically valid Python
-- Base your decision on the results and experiment log provided
-"""
-
-
-def build_prompt(experiment_n: int, train_py: str,
-                  results_summary: str, recent_log: str,
-                  program: str) -> str:
-    return f"""You are running Experiment {experiment_n}.
-
-## Research Brief (program.md summary)
-{program[:2000]}
-
-## Current Results
-{results_summary}
-
-## Recent Experiment Log
-{recent_log}
-
-## Current train.py
-```python
-{train_py}
-```
-
-Based on the results and your research brief, decide what single change 
-to make for Experiment {experiment_n}. 
-
-Remember:
-- val_fid baseline is 3218.9959 (Experiment 1 on real NinaPro E2 data)
-- Target: val_fid < 500, tstr_acc/trtr_acc ratio > 0.85
-- Make ONE theoretically-justified change
-- Output the COMPLETE modified train.py
-
-Respond now as the elite researcher you are."""
+    raise RuntimeError("Claude API failed after 3 attempts")
 
 
 # ─────────────────────────────────────────────
-# PARSE CLAUDE RESPONSE
+# PARSE RESPONSE
 # ─────────────────────────────────────────────
 
 def parse_response(response: str) -> dict:
+    """
+    Parse Claude's response. Expects exactly:
+        HYPOTHESIS: ...
+        CHANGE_LINE: ...
+        NEW_LINE: ...
+        LOG_ENTRY: ...
+    """
     result = {
-        "hypothesis":   "",
-        "change":       "",
-        "new_train_py": "",
-        "log_entry":    "",
+        "hypothesis":  "",
+        "change_line": "",
+        "new_line":    "",
+        "log_entry":   "",
     }
 
-    # Extract HYPOTHESIS
-    if "HYPOTHESIS:" in response:
-        try:
-            hyp_start = response.index("HYPOTHESIS:") + len("HYPOTHESIS:")
-            hyp_end   = response.index("\n", hyp_start)
-            result["hypothesis"] = response[hyp_start:hyp_end].strip()
-        except Exception:
-            pass
+    # Split response into lines for clean parsing
+    lines = response.strip().split("\n")
 
-    # Extract CHANGE
-    if "CHANGE:" in response:
-        try:
-            chg_start = response.index("CHANGE:") + len("CHANGE:")
-            chg_end   = response.index("\n", chg_start)
-            result["change"] = response[chg_start:chg_end].strip()
-        except Exception:
-            pass
+    current_field = None
+    current_value = []
 
-    # Extract new train.py — handles both ```python and ``` fences
-    try:
-        search_from = response.index("NEW_TRAIN_PY:") if "NEW_TRAIN_PY:" in response else 0
-        for marker in ["```python", "```"]:
-            if marker in response[search_from:]:
-                py_start = response.index(marker, search_from) + len(marker)
-                remaining = response[py_start:]
-                if "```" in remaining:
-                    result["new_train_py"] = remaining[:remaining.index("```")].strip()
-                    break
-    except Exception:
-        pass
+    field_map = {
+        "HYPOTHESIS:":  "hypothesis",
+        "CHANGE_LINE:": "change_line",
+        "NEW_LINE:":    "new_line",
+        "LOG_ENTRY:":   "log_entry",
+    }
 
-    # Extract experiment log entry
-    try:
-        if "EXPERIMENT_LOG_ENTRY:" in response:
-            search_from = response.index("EXPERIMENT_LOG_ENTRY:")
-            for marker in ["```markdown", "```"]:
-                if marker in response[search_from:]:
-                    log_start = response.index(marker, search_from) + len(marker)
-                    remaining = response[log_start:]
-                    if "```" in remaining:
-                        result["log_entry"] = remaining[:remaining.index("```")].strip()
-                        break
-    except Exception:
-        pass
+    for line in lines:
+        stripped = line.strip()
+
+        # Check if this line starts a new field
+        matched_field = None
+        for label, key in field_map.items():
+            if stripped.startswith(label):
+                matched_field = key
+                # Save previous field
+                if current_field:
+                    result[current_field] = " ".join(current_value).strip()
+                # Start new field
+                current_field = key
+                current_value = [stripped[len(label):].strip()]
+                break
+
+        if not matched_field and current_field:
+            # Continue accumulating multi-line field
+            if stripped:
+                current_value.append(stripped)
+
+    # Save last field
+    if current_field:
+        result[current_field] = " ".join(current_value).strip()
 
     return result
 
 
-def validate_train_py(code: str) -> bool:
-    """Check that the new train.py is valid Python."""
-    import ast
-    try:
-        ast.parse(code)
-        # Check critical constraints
-        if "TRAIN_TIME_SECONDS" not in code:
-            print("  [validate] WARN: TRAIN_TIME_SECONDS missing")
-            return False
-        if "evaluate(" not in code:
-            print("  [validate] WARN: evaluate() call missing")
-            return False
-        return True
-    except SyntaxError as e:
-        print(f"  [validate] Syntax error: {e}")
+def apply_line_change(change_line: str, new_line: str) -> bool:
+    """
+    Apply a single line change to train.py.
+    Returns True if the line was found and replaced.
+    """
+    src = read_file(TRAIN_FILE)
+
+    # Strip any accidental surrounding quotes or backticks Claude might add
+    change_line = change_line.strip().strip("`").strip("'").strip('"')
+    new_line    = new_line.strip().strip("`").strip("'").strip('"')
+
+    if not change_line:
+        print("  [apply] Empty change_line — skipping")
         return False
+
+    if change_line not in src:
+        # Try fuzzy match — find line containing key part
+        key_part = change_line.split("=")[0].strip() if "=" in change_line else change_line[:20]
+        candidates = [l for l in src.split("\n") if key_part in l and "=" in l]
+        if candidates:
+            # Use the closest match
+            change_line = candidates[0]
+            print(f"  [apply] Fuzzy matched line: {change_line.strip()[:60]}")
+        else:
+            print(f"  [apply] Line not found: {change_line[:60]}")
+            return False
+
+    new_src = src.replace(change_line, new_line, 1)
+
+    # Validate the result is still valid Python
+    try:
+        import ast
+        ast.parse(new_src)
+    except SyntaxError as e:
+        print(f"  [apply] Syntax error after change: {e}")
+        return False
+
+    TRAIN_FILE.write_text(new_src, encoding="utf-8")
+    print(f"  [apply] ✓ {change_line.strip()[:55]}")
+    print(f"       → {new_line.strip()[:55]}")
+    return True
 
 
 # ─────────────────────────────────────────────
-# RUN ONE EXPERIMENT
+# TRAINING
 # ─────────────────────────────────────────────
 
 def run_training() -> dict:
-    """Run python train.py and capture the final metrics."""
-    print("  [train] Running python train.py (5 min budget)...")
+    """Run train.py and return metrics dict."""
+    print("  [train] Running train.py (5 min budget)...")
     start = time.time()
 
-    result = subprocess.run(
+    proc = subprocess.run(
         [sys.executable, "train.py"],
-        capture_output=True,
-        text=True,
-        timeout=450,  # 7.5 min timeout (generous buffer)
+        capture_output=True, text=True, timeout=450,
     )
 
     elapsed = time.time() - start
-    output  = result.stdout + result.stderr
+    output  = proc.stdout + proc.stderr
+    metrics = {"elapsed_s": elapsed, "success": proc.returncode == 0}
 
-    # Parse final metrics from output
-    metrics = {"elapsed_s": elapsed, "success": result.returncode == 0}
-
-    if result.returncode != 0:
-        print(f"  [train] FAILED (returncode={result.returncode})")
-        print(f"  [train] Last 500 chars: {output[-500:]}")
+    if proc.returncode != 0:
+        print(f"  [train] FAILED — last error:")
+        # Print last 3 lines of stderr
+        err_lines = [l for l in proc.stderr.split("\n") if l.strip()]
+        for l in err_lines[-3:]:
+            print(f"    {l}")
         return metrics
 
-    # Extract metrics from the Final Result block
-    lines = output.split("\n")
-    for line in lines:
+    # Parse metrics from output
+    for line in output.split("\n"):
         line = line.strip()
         for key in ["val_fid", "fid", "tstr_acc", "trtr_acc",
                     "tstr_f1", "psd_error", "dtw_mean"]:
@@ -372,72 +361,101 @@ def run_training() -> dict:
                 except Exception:
                     pass
 
-    # Normalise fid key
     if "val_fid" in metrics and "fid" not in metrics:
         metrics["fid"] = metrics["val_fid"]
 
-    print(f"  [train] Done in {elapsed:.0f}s — "
-          f"val_fid={metrics.get('fid', metrics.get('val_fid', '?'))}")
-
+    fid = metrics.get("fid", metrics.get("val_fid", "?"))
+    print(f"  [train] Done in {elapsed:.0f}s | val_fid={fid}")
     return metrics
 
 
-def append_log_entry(entry: str, experiment_n: int, metrics: dict):
-    """Append result metrics to the experiment log entry."""
-    result_block = (
-        f"\n**Result**:\n"
-        f"- val_fid:   {metrics.get('fid', metrics.get('val_fid', '?'))}\n"
-        f"- tstr_acc:  {metrics.get('tstr_acc', '?')}\n"
-        f"- trtr_acc:  {metrics.get('trtr_acc', '?')}\n"
-        f"- psd_error: {metrics.get('psd_error', '?')}\n"
-        f"- dtw_mean:  {metrics.get('dtw_mean', '?')}\n"
-    )
-    full_entry = entry + result_block + "\n\n---\n\n"
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+
+def log_experiment(exp_n: int, hypothesis: str, change_line: str,
+                   new_line: str, log_entry: str,
+                   metrics: dict, decision: str):
+    """Write to experiment_log.md."""
+    fid      = metrics.get("fid", metrics.get("val_fid", "?"))
+    tstr     = metrics.get("tstr_acc", "?")
+    trtr     = metrics.get("trtr_acc", "?")
+    psd      = metrics.get("psd_error", "?")
+    dtw      = metrics.get("dtw_mean", "?")
+    elapsed  = metrics.get("elapsed_s", "?")
+
+    entry = f"""## Experiment {exp_n} — {change_line.strip()[:60]}
+
+**Hypothesis**: {hypothesis}
+
+**Change**:
+- Before: `{change_line.strip()}`
+- After:  `{new_line.strip()}`
+
+**Agent notes**: {log_entry}
+
+**Result**:
+| Metric | Value |
+|--------|-------|
+| val_fid | {fid} |
+| tstr_acc | {tstr} |
+| trtr_acc | {trtr} |
+| psd_error | {psd} |
+| dtw_mean | {dtw} |
+| elapsed_s | {elapsed:.0f}s |
+
+**Decision**: {decision}
+
+---
+
+"""
     with open(EXPERIMENT_LOG, "a", encoding="utf-8") as f:
-        f.write(full_entry)
+        f.write(entry)
 
 
-PAPER_TRACKER = Path("paper_tracker.md")
-
-def update_paper_tracker(experiment_n: int, change: str, hypothesis: str,
+def update_paper_tracker(exp_n: int, change_line: str, new_line: str,
                           metrics: dict, decision: str, best_fid: float):
-    """
-    Update paper_tracker.md after every experiment.
-    Adds a row to the results table and updates the best config block.
-    This document becomes the source of truth for writing the paper.
-    """
+    """Add a row to the results table in paper_tracker.md."""
     if not PAPER_TRACKER.exists():
         return
 
-    fid       = metrics.get('fid', metrics.get('val_fid', 0))
-    tstr_acc  = metrics.get('tstr_acc', 0)
-    trtr_acc  = metrics.get('trtr_acc', 0)
-    psd_error = metrics.get('psd_error', 0)
-    ratio     = round(tstr_acc / trtr_acc, 3) if trtr_acc > 0 else 0
+    fid      = metrics.get("fid", metrics.get("val_fid", 0))
+    tstr_acc = metrics.get("tstr_acc", 0)
+    trtr_acc = metrics.get("trtr_acc", 0)
+    psd      = metrics.get("psd_error", 0)
+    ratio    = round(tstr_acc / trtr_acc, 3) if trtr_acc and trtr_acc > 0 else 0
+
+    # Short description for table
+    desc = new_line.strip()[:45] if new_line else change_line.strip()[:45]
+
+    new_row = (
+        f"| {exp_n} | {desc} | "
+        f"{fid:.2f} | {tstr_acc:.4f} | {trtr_acc:.4f} | "
+        f"{ratio:.3f} | {psd:.2f} | {decision} |\n"
+    )
 
     content = PAPER_TRACKER.read_text(encoding="utf-8")
+    marker  = "---\n\n## SECTION B"
+    if marker in content:
+        content = content.replace(marker, new_row + marker, 1)
 
-    # ── 1. Add row to results table ───────────────────────
-    new_row = (
-        f"| {experiment_n} | {change[:50]} | "
-        f"{fid:.2f} | {tstr_acc:.4f} | {trtr_acc:.4f} | "
-        f"{ratio:.3f} | {psd_error:.2f} | {decision} |\n"
+    # Update timestamp
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    content = re.sub(
+        r"\*\*Last updated\*\*:.*",
+        f"**Last updated**: {ts} (Experiment {exp_n})",
+        content
     )
-    # Insert before the closing --- of the table section
-    table_marker = "---\n\n## SECTION B"
-    if table_marker in content:
-        content = content.replace(table_marker, new_row + table_marker)
 
-    # ── 2. Update best config if improved ─────────────────
+    # Update best config block if improved
     if decision == "KEEP":
-        # Read current train.py hparams
         train_src = read_file(TRAIN_FILE)
         hparams   = {}
         for param in ["D_MODEL", "DEPTH", "N_HEADS", "PATCH_SIZE",
                       "T_STEPS", "SCHEDULE", "SAMPLE_GUIDANCE",
                       "LEARNING_RATE", "BATCH_SIZE"]:
             for line in train_src.split("\n"):
-                if f"{param}" in line and "=" in line and "#" not in line.split("=")[0][-1:]:
+                if param in line and "=" in line and not line.strip().startswith("#"):
                     try:
                         val = line.split("=")[1].strip().split("#")[0].strip().strip('"')
                         hparams[param] = val
@@ -448,53 +466,20 @@ def update_paper_tracker(experiment_n: int, change: str, hypothesis: str,
         best_block = (
             f"```\n"
             f"Best val_fid     : {best_fid:.4f}\n"
-            f"Best experiment  : {experiment_n}\n"
-            f"Key hyperparams  : "
-            f"D_MODEL={hparams.get('D_MODEL','?')}, "
+            f"Best experiment  : {exp_n}\n"
+            f"Key hyperparams  : D_MODEL={hparams.get('D_MODEL','?')}, "
             f"DEPTH={hparams.get('DEPTH','?')}, "
             f"N_HEADS={hparams.get('N_HEADS','?')}, "
             f"PATCH={hparams.get('PATCH_SIZE','?')}\n"
-            f"                   "
-            f"T={hparams.get('T_STEPS','?')}, "
+            f"                   T={hparams.get('T_STEPS','?')}, "
             f"Schedule={hparams.get('SCHEDULE','?')}, "
             f"Guidance={hparams.get('SAMPLE_GUIDANCE','?')}\n"
-            f"                   "
-            f"Batch={hparams.get('BATCH_SIZE','?')}, "
+            f"                   Batch={hparams.get('BATCH_SIZE','?')}, "
             f"LR={hparams.get('LEARNING_RATE','?')}\n"
             f"```"
         )
-        # Replace existing best block
-        import re
-        content = re.sub(r"```\nBest val_fid.*?```", best_block,
-                         content, flags=re.DOTALL)
-
-    # ── 3. Update timestamp ────────────────────────────────
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    content = re.sub(
-        r"\*\*Last updated\*\*:.*",
-        f"**Last updated**: {timestamp} (Experiment {experiment_n})",
-        content
-    )
-
-    # ── 4. Add discovery note if big improvement ──────────
-    if decision == "KEEP":
-        baseline = 3218.9959
-        improvement_pct = (baseline - fid) / baseline * 100
-        if improvement_pct > 10:
-            discovery = (
-                f"\n- **Exp {experiment_n}** ({timestamp}): "
-                f"{change} → FID dropped {improvement_pct:.1f}% "
-                f"to {fid:.2f}. {hypothesis}\n"
-            )
-            content = content.replace(
-                "*Nothing yet — experiments starting now.*",
-                discovery.strip()
-            )
-            # Append to existing discoveries
-            if "**Exp" in content and "*Nothing yet*" not in content:
-                disc_marker = "---\n\n## SECTION E"
-                if disc_marker in content:
-                    content = content.replace(disc_marker, discovery + disc_marker)
+        content = re.sub(r"```\nBest val_fid.*?```",
+                         best_block, content, flags=re.DOTALL)
 
     PAPER_TRACKER.write_text(content, encoding="utf-8")
 
@@ -503,144 +488,115 @@ def update_paper_tracker(experiment_n: int, change: str, hypothesis: str,
 # MAIN LOOP
 # ─────────────────────────────────────────────
 
-def run_autoresearch(n_experiments: int = 50, start_from: int = 2):
-    """
-    Main autoresearch loop.
-    Runs n_experiments iterations of: Claude decides → modify train.py → train → evaluate → repeat
-    """
-    api_key = get_api_key()
-    program = read_file(PROGRAM_FILE)
+def run_autoresearch(n_experiments: int = 30, start_from: int = 2):
+    api_key       = get_api_key()
+    best_fid      = BASELINE_FID
+    session_start = time.time()
 
     print(f"\n{'='*60}")
     print(f"  DiT-EMG Autoresearch Loop")
-    print(f"  Model : {MODEL}")
-    print(f"  Experiments : {n_experiments} (starting from {start_from})")
-    print(f"  Baseline val_fid : 3218.9959")
+    print(f"  Model      : {MODEL}")
+    print(f"  Experiments: {n_experiments} (from Exp {start_from})")
+    print(f"  Baseline   : val_fid = {BASELINE_FID}")
     print(f"{'='*60}\n")
 
-    # Track best
-    best_fid = 3218.9959  # baseline from Experiment 1
-    session_start = time.time()
-
     for exp_n in range(start_from, start_from + n_experiments):
+        elapsed_h = (time.time() - session_start) / 3600
         print(f"\n{'─'*50}")
-        print(f"  EXPERIMENT {exp_n}")
-        print(f"  Time elapsed: {(time.time()-session_start)/3600:.1f}h")
-        print(f"  Best FID so far: {best_fid:.4f}")
+        print(f"  EXPERIMENT {exp_n}  |  elapsed {elapsed_h:.1f}h  |  best FID {best_fid:.2f}")
         print(f"{'─'*50}")
 
-        # ── Read current state ────────────────────────────
-        train_py        = read_file(TRAIN_FILE)
-        results_summary = read_results(n_recent=8)
-        recent_log      = read_experiment_log(n_recent=3)
+        # ── Read context ──────────────────────────────────
+        train_py = read_file(TRAIN_FILE)
+        hparams  = extract_hparams_block(train_py)
+        results  = read_results_summary()
+        log      = read_recent_log()
 
-        # ── Ask Claude what to change ─────────────────────
-        print(f"  [claude] Asking for Experiment {exp_n} decision...")
-        prompt = build_prompt(
-            experiment_n    = exp_n,
-            train_py        = train_py,
-            results_summary = results_summary,
-            recent_log      = recent_log,
-            program         = program,
-        )
-
+        # ── Ask Claude ────────────────────────────────────
+        print(f"  [claude] Thinking...")
         try:
-            response = call_claude(prompt, SYSTEM_PROMPT, api_key)
+            prompt   = build_prompt(exp_n, hparams, results, log)
+            response = call_claude(prompt, api_key)
         except Exception as e:
-            print(f"  [claude] API call failed: {e}")
-            print("  Skipping this experiment...")
+            print(f"  [claude] Failed: {e} — skipping")
             time.sleep(30)
             continue
 
-        # ── Parse response ────────────────────────────────
+        # ── Parse ─────────────────────────────────────────
         parsed = parse_response(response)
 
-        print(f"  [claude] Hypothesis: {parsed['hypothesis']}")
-        print(f"  [claude] Change: {parsed['change']}")
+        hypothesis  = parsed["hypothesis"]
+        change_line = parsed["change_line"]
+        new_line    = parsed["new_line"]
+        log_entry   = parsed["log_entry"]
 
-        if not parsed["new_train_py"]:
-            print("  [parse] Could not extract new train.py — skipping")
+        print(f"  [claude] Hypothesis : {hypothesis[:80]}")
+        print(f"  [claude] Change     : {change_line.strip()[:60]}")
+        print(f"  [claude]         →  : {new_line.strip()[:60]}")
+
+        if not change_line or not new_line:
+            print("  [parse] Missing CHANGE_LINE or NEW_LINE — skipping")
+            print(f"  [debug] Raw response:\n{response[:500]}")
             continue
 
-        # ── Validate and apply change ──────────────────────
-        if not validate_train_py(parsed["new_train_py"]):
-            print("  [validate] Invalid train.py — skipping experiment")
+        if change_line.strip() == new_line.strip():
+            print("  [parse] Change_line equals new_line — nothing to do, skipping")
             continue
 
-        # Backup current train.py
+        # ── Apply change ──────────────────────────────────
         backup_train_py(exp_n)
+        if not apply_line_change(change_line, new_line):
+            print("  [apply] Failed to apply change — skipping")
+            restore_train_py(exp_n)
+            continue
 
-        # Write new train.py
-        TRAIN_FILE.write_text(parsed["new_train_py"], encoding="utf-8")
-        print(f"  [apply] train.py updated")
-
-        # ── Run training ──────────────────────────────────
+        # ── Train ─────────────────────────────────────────
         metrics = run_training()
 
         if not metrics["success"]:
-            print(f"  [result] Training failed — reverting train.py")
+            print("  [result] Training crashed — reverting")
             restore_train_py(exp_n)
-            if parsed["log_entry"]:
-                append_log_entry(
-                    parsed["log_entry"] + "\n**Decision**: REVERTED — training crashed",
-                    exp_n, metrics
-                )
+            decision = "REVERTED (crash)"
+            log_experiment(exp_n, hypothesis, change_line, new_line,
+                           log_entry, metrics, decision)
             continue
 
-        # ── Evaluate result ───────────────────────────────
+        # ── Evaluate ──────────────────────────────────────
         current_fid = metrics.get("fid", metrics.get("val_fid", float("inf")))
 
-        if isinstance(current_fid, (int, float)) and current_fid < best_fid:
-            improvement = (best_fid - current_fid) / best_fid * 100
-            print(f"  [result] ✓ IMPROVEMENT: {best_fid:.4f} → {current_fid:.4f} "
-                  f"(-{improvement:.1f}%)")
+        if isinstance(current_fid, float) and current_fid < best_fid:
+            pct = (best_fid - current_fid) / best_fid * 100
+            print(f"  [result] ✓ IMPROVEMENT  {best_fid:.2f} → {current_fid:.2f}  (-{pct:.1f}%)")
             best_fid = current_fid
             decision = "KEEP"
         else:
-            print(f"  [result] ✗ No improvement: {current_fid} vs best {best_fid:.4f}")
-            print(f"  [result] Reverting train.py...")
+            print(f"  [result] ✗ No improvement  ({current_fid} vs best {best_fid:.2f}) — reverting")
             restore_train_py(exp_n)
             decision = "REVERTED"
 
-        # ── Log result ────────────────────────────────────
-        if parsed["log_entry"]:
-            append_log_entry(
-                parsed["log_entry"] + f"\n**Decision**: {decision}",
-                exp_n, metrics
-            )
+        # ── Log ───────────────────────────────────────────
+        log_experiment(exp_n, hypothesis, change_line, new_line,
+                       log_entry, metrics, decision)
+        update_paper_tracker(exp_n, change_line, new_line,
+                              metrics, decision, best_fid)
 
-        # ── Update paper tracker ──────────────────────────
-        update_paper_tracker(
-            experiment_n = exp_n,
-            change       = parsed["change"],
-            hypothesis   = parsed["hypothesis"],
-            metrics      = metrics,
-            decision     = decision,
-            best_fid     = best_fid,
-        )
-
-        # ── Print summary ──────────────────────────────────
-        print(f"\n  Experiment {exp_n} summary:")
-        print(f"  Decision  : {decision}")
-        print(f"  val_fid   : {current_fid}")
-        print(f"  Best so far: {best_fid:.4f}")
-
-        # Small pause between experiments
-        time.sleep(5)
+        print(f"\n  ── Exp {exp_n} done | decision={decision} | best FID={best_fid:.2f} ──")
+        time.sleep(3)
 
     # ── Final summary ─────────────────────────────────────
-    total_time = (time.time() - session_start) / 3600
+    total_h = (time.time() - session_start) / 3600
+    improvement = (BASELINE_FID - best_fid) / BASELINE_FID * 100
     print(f"\n{'='*60}")
     print(f"  Autoresearch complete!")
-    print(f"  Total time    : {total_time:.1f} hours")
+    print(f"  Time          : {total_h:.1f} hours")
     print(f"  Experiments   : {n_experiments}")
-    print(f"  Starting FID  : 3218.9959")
-    print(f"  Final best FID: {best_fid:.4f}")
-    print(f"  Improvement   : {(3218.9959 - best_fid) / 3218.9959 * 100:.1f}%")
+    print(f"  Baseline FID  : {BASELINE_FID}")
+    print(f"  Best FID      : {best_fid:.4f}")
+    print(f"  Improvement   : {improvement:.1f}%")
+    print(f"  Logs          : {EXPERIMENT_LOG}")
+    print(f"  Paper tracker : {PAPER_TRACKER}")
+    print(f"  Best model    : checkpoints/best_model.pt")
     print(f"{'='*60}")
-    print(f"\nResults saved to: {RESULTS_FILE}")
-    print(f"Experiment log : {EXPERIMENT_LOG}")
-    print(f"Best model     : checkpoints/best_model.pt")
 
 
 # ─────────────────────────────────────────────
@@ -648,14 +604,8 @@ def run_autoresearch(n_experiments: int = 50, start_from: int = 2):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DiT-EMG Autoresearch Loop")
-    parser.add_argument("--experiments", type=int, default=50,
-                        help="Number of experiments to run (default: 50)")
-    parser.add_argument("--start-from",  type=int, default=2,
-                        help="Start experiment number (default: 2, after baseline)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--experiments", type=int, default=30)
+    parser.add_argument("--start-from",  type=int, default=2)
     args = parser.parse_args()
-
-    run_autoresearch(
-        n_experiments = args.experiments,
-        start_from    = args.start_from,
-    )
+    run_autoresearch(args.experiments, args.start_from)
