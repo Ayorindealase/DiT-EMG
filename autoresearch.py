@@ -259,37 +259,57 @@ Respond now as the elite researcher you are."""
 # ─────────────────────────────────────────────
 
 def parse_response(response: str) -> dict:
-    """Extract hypothesis, new train.py, and log entry from Claude's response."""
     result = {
-        "hypothesis":    "",
-        "change":        "",
-        "new_train_py":  "",
-        "log_entry":     "",
+        "hypothesis":   "",
+        "change":       "",
+        "new_train_py": "",
+        "log_entry":    "",
     }
 
     # Extract HYPOTHESIS
     if "HYPOTHESIS:" in response:
-        hyp_start = response.index("HYPOTHESIS:") + len("HYPOTHESIS:")
-        hyp_end   = response.index("\n", hyp_start)
-        result["hypothesis"] = response[hyp_start:hyp_end].strip()
+        try:
+            hyp_start = response.index("HYPOTHESIS:") + len("HYPOTHESIS:")
+            hyp_end   = response.index("\n", hyp_start)
+            result["hypothesis"] = response[hyp_start:hyp_end].strip()
+        except Exception:
+            pass
 
     # Extract CHANGE
     if "CHANGE:" in response:
-        chg_start = response.index("CHANGE:") + len("CHANGE:")
-        chg_end   = response.index("\n", chg_start)
-        result["change"] = response[chg_start:chg_end].strip()
+        try:
+            chg_start = response.index("CHANGE:") + len("CHANGE:")
+            chg_end   = response.index("\n", chg_start)
+            result["change"] = response[chg_start:chg_end].strip()
+        except Exception:
+            pass
 
-    # Extract new train.py (between ```python and ```)
-    if "NEW_TRAIN_PY:" in response and "```python" in response:
-        py_start = response.index("```python", response.index("NEW_TRAIN_PY:")) + len("```python")
-        py_end   = response.index("```", py_start)
-        result["new_train_py"] = response[py_start:py_end].strip()
+    # Extract new train.py — handles both ```python and ``` fences
+    try:
+        search_from = response.index("NEW_TRAIN_PY:") if "NEW_TRAIN_PY:" in response else 0
+        for marker in ["```python", "```"]:
+            if marker in response[search_from:]:
+                py_start = response.index(marker, search_from) + len(marker)
+                remaining = response[py_start:]
+                if "```" in remaining:
+                    result["new_train_py"] = remaining[:remaining.index("```")].strip()
+                    break
+    except Exception:
+        pass
 
     # Extract experiment log entry
-    if "EXPERIMENT_LOG_ENTRY:" in response and "```markdown" in response:
-        log_start = response.index("```markdown", response.index("EXPERIMENT_LOG_ENTRY:")) + len("```markdown")
-        log_end   = response.index("```", log_start)
-        result["log_entry"] = response[log_start:log_end].strip()
+    try:
+        if "EXPERIMENT_LOG_ENTRY:" in response:
+            search_from = response.index("EXPERIMENT_LOG_ENTRY:")
+            for marker in ["```markdown", "```"]:
+                if marker in response[search_from:]:
+                    log_start = response.index(marker, search_from) + len(marker)
+                    remaining = response[log_start:]
+                    if "```" in remaining:
+                        result["log_entry"] = remaining[:remaining.index("```")].strip()
+                        break
+    except Exception:
+        pass
 
     return result
 
